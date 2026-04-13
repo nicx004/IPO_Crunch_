@@ -38,6 +38,11 @@ IPO_DIR.mkdir(exist_ok=True)
 LLM_KEY    = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY", "")
 LLM_MODEL  = os.getenv("LLM_MODEL", "deepseek/deepseek-chat-v3-0324:free")
 LLM_BASE   = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
+LLM_FALLBACK_MODELS = [
+  m.strip()
+  for m in os.getenv("LLM_MODEL_FALLBACKS", "google/gemma-4-26b-a4b-it:free").split(",")
+  if m.strip()
+]
 PORT       = int(os.getenv("PORT", 7860))
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "").strip()
 
@@ -71,6 +76,46 @@ def _cors_origins() -> list[str]:
 
 def _key(name: str) -> str:
     return re.sub(r"[^a-z0-9 ]", "", name.lower()).strip()
+
+
+def _model_candidates() -> list[str]:
+  candidates = [LLM_MODEL]
+  for model_name in LLM_FALLBACK_MODELS:
+    if model_name and model_name not in candidates:
+      candidates.append(model_name)
+  return candidates
+
+
+def _is_missing_model_error(exc: Exception) -> bool:
+  message = str(exc).lower()
+  return "no endpoints found" in message or "404" in message
+
+
+def _create_chat_completion(messages: list[dict], temperature: float, max_tokens: int, model_name: str):
+  return llm.chat.completions.create(
+    model=model_name,
+    messages=messages,
+    temperature=temperature,
+    max_tokens=max_tokens,
+  )
+
+
+def _chat_with_model_fallback(messages: list[dict], temperature: float, max_tokens: int) -> tuple[str, str]:
+  last_error: Exception | None = None
+  for model_name in _model_candidates():
+    try:
+      resp = _create_chat_completion(messages, temperature, max_tokens, model_name)
+      content = resp.choices[0].message.content or ""
+      return content, model_name
+    except Exception as exc:
+      last_error = exc
+      print(f"LLM call failed for model {model_name}: {exc}")
+      if not _is_missing_model_error(exc):
+        break
+
+  if last_error is not None:
+    raise last_error
+  raise RuntimeError("LLM call failed without raising a specific error")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -249,35 +294,34 @@ DRHP Text:
 
 
 def extract_profile(company: str, text: str) -> dict:
-    """Single LLM call — extracts all fields at once."""
-    if not LLM_KEY:
-        return _fallback_profile(company)
-    if not text.strip():
-        return _fallback_profile(company)
+  """Single LLM call — extracts all fields at once."""
+  if not LLM_KEY:
+    return _fallback_profile(company)
+  if not text.strip():
+    return _fallback_profile(company)
 
-    prompt = EXTRACTION_PROMPT.format(company=company, text=text[:15000])
-    try:
-        resp = llm.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=2000,
-        )
-        raw = resp.choices[0].message.content or ""
-        # Strip markdown fences if model adds them
-        raw = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
-        raw = re.sub(r"\s*```$", "", raw).strip()
-        data = json.loads(raw)
-        data["company"] = company
-        data["extracted_at"] = time.time()
-        data["status"] = "extracted"
-        return data
-    except json.JSONDecodeError as e:
-        print(f"JSON parse failed for {company}: {e}")
-        return _fallback_profile(company)
-    except Exception as e:
-        print(f"LLM extraction failed for {company}: {e}")
-        return _fallback_profile(company)
+  prompt = EXTRACTION_PROMPT.format(company=company, text=text[:15000])
+  try:
+    raw, model_used = _chat_with_model_fallback(
+      messages=[{"role": "user", "content": prompt}],
+      temperature=0.1,
+      max_tokens=2000,
+    )
+    # Strip markdown fences if model adds them
+    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```$", "", raw).strip()
+    data = json.loads(raw)
+    data["company"] = company
+    data["extracted_at"] = time.time()
+    data["status"] = "extracted"
+    data["llm_model"] = model_used
+    return data
+  except json.JSONDecodeError as e:
+    print(f"JSON parse failed for {company}: {e}")
+    return _fallback_profile(company)
+  except Exception as e:
+    print(f"LLM extraction failed for {company}: {e}")
+    return _fallback_profile(company)
 
 
 def _fallback_profile(company: str) -> dict:
@@ -405,13 +449,12 @@ DRHP Context (first {len(context)} characters of filing):
     messages.append({"role": "user", "content": message})
 
     try:
-        resp = llm.chat.completions.create(
-            model=LLM_MODEL,
-            messages=messages,
-            temperature=0.2,
-            max_tokens=1000,
-        )
-        return resp.choices[0].message.content or "No response generated."
+      content, model_used = _chat_with_model_fallback(
+        messages=messages,
+        temperature=0.2,
+        max_tokens=1000,
+      )
+      return content or f"No response generated from {model_used}."
     except Exception as e:
         return f"Error: {str(e)}"
 
