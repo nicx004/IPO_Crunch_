@@ -51,6 +51,7 @@ INFLIGHT: set[str] = set()           # company keys currently being extracted
 LOCK = threading.Lock()
 STARTUP_DONE = False
 PIPELINE_LOCK = threading.Lock()
+LAST_STARTUP_STATUS = "not_started"
 
 
 def _cors_origins() -> list[str]:
@@ -153,17 +154,18 @@ def scrape_sebi_drhps() -> int:
                 continue
             try:
                 full_url = href if href.startswith("http") else "https://www.sebi.gov.in" + href
-                page = requests.get(full_url, headers=HEADERS, timeout=20)
-                page_soup = BeautifulSoup(page.text, "html.parser")
-                pdf_url = None
-                iframe = page_soup.find("iframe")
-                if iframe and iframe.get("src"):
-                    pdf_url = iframe["src"]
+                pdf_url = full_url if full_url.lower().endswith(".pdf") else None
                 if not pdf_url:
+                  page = requests.get(full_url, headers=HEADERS, timeout=20)
+                  page_soup = BeautifulSoup(page.text, "html.parser")
+                  iframe = page_soup.find("iframe")
+                  if iframe and iframe.get("src"):
+                    pdf_url = iframe["src"]
+                  if not pdf_url:
                     for a2 in page_soup.find_all("a", href=True):
-                        if ".pdf" in a2["href"].lower():
-                            pdf_url = a2["href"]
-                            break
+                      if ".pdf" in a2["href"].lower():
+                        pdf_url = a2["href"]
+                        break
                 if not pdf_url:
                     continue
                 if not pdf_url.startswith("http"):
@@ -341,28 +343,33 @@ def trigger_extraction(company: str, force: bool = False) -> None:
 
 
 def startup_pipeline() -> None:
-    """Full startup: scrape → extract all companies."""
-    global STARTUP_DONE
+  """Full startup: scrape → extract all companies."""
+  global STARTUP_DONE, LAST_STARTUP_STATUS
 
-    if not PIPELINE_LOCK.acquire(blocking=False):
-        print("Startup pipeline already running; skipping duplicate trigger")
-        return
+  if not PIPELINE_LOCK.acquire(blocking=False):
+    print("Startup pipeline already running; skipping duplicate trigger")
+    return
 
-    print("=== Startup pipeline starting ===")
-    try:
-        # 1. Download fresh DRHPs from SEBI
-        scrape_sebi_drhps()
-        # 2. Extract all companies found (staggered to avoid API rate limits)
-        companies = list_companies()
-        print(f"Starting extraction for {len(companies)} companies...")
-        for i, company in enumerate(companies):
-            if i > 0:
-                time.sleep(3)
-            trigger_extraction(company)
-        STARTUP_DONE = True
-        print("=== Startup pipeline complete ===")
-    finally:
-        PIPELINE_LOCK.release()
+  print("=== Startup pipeline starting ===")
+  LAST_STARTUP_STATUS = "running"
+  try:
+    # 1. Download fresh DRHPs from SEBI
+    downloaded = scrape_sebi_drhps()
+    # 2. Extract all companies found (staggered to avoid API rate limits)
+    companies = list_companies()
+    print(f"Starting extraction for {len(companies)} companies...")
+    for i, company in enumerate(companies):
+      if i > 0:
+        time.sleep(3)
+      trigger_extraction(company)
+    STARTUP_DONE = True
+    LAST_STARTUP_STATUS = f"complete: downloaded={downloaded}, companies={len(companies)}"
+    print("=== Startup pipeline complete ===")
+  except Exception as e:
+    LAST_STARTUP_STATUS = f"error: {e}"
+    raise
+  finally:
+    PIPELINE_LOCK.release()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -439,7 +446,8 @@ class ChatRequest(BaseModel):
 def health():
     return {"status": "ok", "startup_done": STARTUP_DONE,
       "companies": len(list_companies()), "cached": len(CACHE),
-      "refresh_protected": bool(REFRESH_TOKEN)}
+      "refresh_protected": bool(REFRESH_TOKEN),
+      "startup_status": LAST_STARTUP_STATUS}
 
 
 @app.get("/api/companies")
