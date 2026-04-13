@@ -43,6 +43,7 @@ LLM_FALLBACK_MODELS = [
   for m in os.getenv("LLM_MODEL_FALLBACKS", "google/gemma-4-26b-a4b-it:free").split(",")
   if m.strip()
 ]
+ENABLE_WEB_ENRICHMENT = os.getenv("ENABLE_WEB_ENRICHMENT", "1").strip().lower() in {"1", "true", "yes", "on"}
 PORT       = int(os.getenv("PORT", 7860))
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "").strip()
 
@@ -375,6 +376,74 @@ def _fill_missing_basic_metrics(data: dict, text: str) -> dict:
   return data
 
 
+def _fetch_web_snippets(company: str) -> str:
+  """Lightweight public web search fallback for live IPO signals (GMP/subscription)."""
+  if not ENABLE_WEB_ENRICHMENT:
+    return ""
+
+  query = f"{company} IPO grey market premium GMP subscription status price band lot size"
+  headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+  }
+
+  try:
+    resp = requests.get("https://duckduckgo.com/html/", params={"q": query}, headers=headers, timeout=20)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    snippets = [
+      " ".join(sn.get_text(" ").split())
+      for sn in soup.select(".result__snippet")[:8]
+      if sn.get_text(strip=True)
+    ]
+    return "\n".join(snippets)
+  except Exception as e:
+    print(f"Web enrichment search failed for {company}: {e}")
+    return ""
+
+
+def _fill_missing_from_web(company: str, data: dict) -> dict:
+  missing_fields = [
+    field for field in ("issue_size", "price_band", "lot_size", "implied_value", "grey_market")
+    if not data.get(field)
+  ]
+  if not missing_fields and data.get("subscription_status") not in (None, "", "Not yet open"):
+    return data
+
+  snippets = _fetch_web_snippets(company)
+  if not snippets:
+    return data
+
+  # Reuse existing DRHP metric parser on search snippets for consistent formatting.
+  web_metrics = _extract_basic_metrics_from_text(snippets)
+  for field, value in web_metrics.items():
+    if not data.get(field) and value:
+      data[field] = value
+
+  if not data.get("grey_market"):
+    gmp_match = re.search(
+      r"(?i)(?:gmp|grey\s*market\s*premium).{0,30}?(?:rs\.?|inr|₹)?\s*([+-]?[0-9][0-9,]*(?:\.[0-9]+)?)",
+      snippets,
+    )
+    if gmp_match:
+      data["grey_market"] = f"INR {gmp_match.group(1)} premium"
+
+  sub_text = data.get("subscription_status")
+  if not sub_text or sub_text == "Not yet open":
+    sub_match = re.search(
+      r"(?i)([0-9]+(?:\.[0-9]+)?)\s*x\s*(?:subscribed|subscription)",
+      snippets,
+    )
+    if not sub_match:
+      sub_match = re.search(
+        r"(?i)(?:subscribed|subscription).{0,20}?([0-9]+(?:\.[0-9]+)?)\s*x",
+        snippets,
+      )
+    if sub_match:
+      data["subscription_status"] = f"{sub_match.group(1)}x subscribed"
+
+  return data
+
+
 def extract_profile(company: str, text: str) -> dict:
   """Single LLM call — extracts all fields at once."""
   if not LLM_KEY:
@@ -397,13 +466,16 @@ def extract_profile(company: str, text: str) -> dict:
     data["extracted_at"] = time.time()
     data["status"] = "extracted"
     data["llm_model"] = model_used
-    return _fill_missing_basic_metrics(data, text)
+    data = _fill_missing_basic_metrics(data, text)
+    return _fill_missing_from_web(company, data)
   except json.JSONDecodeError as e:
     print(f"JSON parse failed for {company}: {e}")
-    return _fill_missing_basic_metrics(_fallback_profile(company), text)
+    data = _fill_missing_basic_metrics(_fallback_profile(company), text)
+    return _fill_missing_from_web(company, data)
   except Exception as e:
     print(f"LLM extraction failed for {company}: {e}")
-    return _fill_missing_basic_metrics(_fallback_profile(company), text)
+    data = _fill_missing_basic_metrics(_fallback_profile(company), text)
+    return _fill_missing_from_web(company, data)
 
 
 def _fallback_profile(company: str) -> dict:
