@@ -293,6 +293,88 @@ DRHP Text:
 """
 
 
+def _format_inr(value: str, unit: str | None = None, suffix: str = "") -> str:
+  normalized_unit = (unit or "").strip().lower()
+  unit_map = {
+    "cr": "crore",
+    "crore": "crore",
+    "lakh": "lakh",
+    "lakhs": "lakh",
+    "million": "million",
+    "billion": "billion",
+  }
+  display_unit = unit_map.get(normalized_unit, normalized_unit)
+  base = f"INR {value}"
+  if display_unit:
+    base = f"{base} {display_unit}"
+  if suffix:
+    base = f"{base} {suffix}"
+  return base
+
+
+def _extract_basic_metrics_from_text(text: str) -> dict[str, str]:
+  compact = " ".join(text.split())
+  metrics: dict[str, str] = {}
+
+  issue_match = re.search(
+    r"(?i)(?:issue size|offer size|fresh issue(?: size)?|total issue size|total offer size)"
+    r".{0,80}?(?:rs\.?|inr|₹)\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(crore|cr|lakh|lakhs|million|billion)?",
+    compact,
+  )
+  if issue_match:
+    metrics["issue_size"] = _format_inr(issue_match.group(1), issue_match.group(2))
+
+  price_band_match = re.search(
+    r"(?i)(?:price band|price band of|price per equity share).{0,80}?"
+    r"(?:rs\.?|inr|₹)\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:-|to|–)\s*"
+    r"(?:rs\.?|inr|₹)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+    compact,
+  )
+  if price_band_match:
+    metrics["price_band"] = f"INR {price_band_match.group(1)} - {price_band_match.group(2)} per share"
+
+  lot_size_match = re.search(
+    r"(?i)(?:lot size|minimum bid lot|market lot).{0,40}?([0-9][0-9,]{0,6})\s*(?:equity\s*shares|shares)",
+    compact,
+  )
+  if lot_size_match:
+    metrics["lot_size"] = f"{lot_size_match.group(1)} shares"
+
+  implied_value_match = re.search(
+    r"(?i)(?:market cap(?:italization)?|post-issue market cap|implied valuation).{0,80}?"
+    r"(?:rs\.?|inr|₹)\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(crore|cr|lakh|lakhs|million|billion)",
+    compact,
+  )
+  if implied_value_match:
+    metrics["implied_value"] = _format_inr(implied_value_match.group(1), implied_value_match.group(2), "post-issue market cap")
+
+  return metrics
+
+
+def _fill_missing_basic_metrics(data: dict, text: str) -> dict:
+  extracted = _extract_basic_metrics_from_text(text)
+  missing_tokens = {
+    "",
+    "null",
+    "none",
+    "n/a",
+    "awaiting data",
+    "awaiting extraction.",
+    "pending analysis.",
+  }
+
+  for field, value in extracted.items():
+    current = data.get(field)
+    current_str = str(current).strip().lower() if current is not None else ""
+    if current is None or current_str in missing_tokens:
+      data[field] = value
+
+  if not data.get("subscription_status"):
+    data["subscription_status"] = "Not yet open"
+
+  return data
+
+
 def extract_profile(company: str, text: str) -> dict:
   """Single LLM call — extracts all fields at once."""
   if not LLM_KEY:
@@ -315,13 +397,13 @@ def extract_profile(company: str, text: str) -> dict:
     data["extracted_at"] = time.time()
     data["status"] = "extracted"
     data["llm_model"] = model_used
-    return data
+    return _fill_missing_basic_metrics(data, text)
   except json.JSONDecodeError as e:
     print(f"JSON parse failed for {company}: {e}")
-    return _fallback_profile(company)
+    return _fill_missing_basic_metrics(_fallback_profile(company), text)
   except Exception as e:
     print(f"LLM extraction failed for {company}: {e}")
-    return _fallback_profile(company)
+    return _fill_missing_basic_metrics(_fallback_profile(company), text)
 
 
 def _fallback_profile(company: str) -> dict:
