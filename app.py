@@ -169,8 +169,14 @@ def scrape_sebi_drhps() -> int:
                 if not pdf_url.startswith("http"):
                     pdf_url = "https://www.sebi.gov.in" + pdf_url
                 pdf_resp = requests.get(pdf_url, headers={**HEADERS, "Referer": full_url}, timeout=30)
-                if "application/pdf" not in pdf_resp.headers.get("Content-Type", ""):
-                    continue
+                content_type = (pdf_resp.headers.get("Content-Type", "") or "").lower()
+                looks_like_pdf = (
+                  "application/pdf" in content_type
+                  or pdf_url.lower().endswith(".pdf")
+                  or pdf_resp.content[:4] == b"%PDF"
+                )
+                if not looks_like_pdf:
+                  continue
                 out_path.write_bytes(pdf_resp.content)
                 downloaded += 1
                 print(f"Downloaded: {out_path.name}")
@@ -432,7 +438,8 @@ class ChatRequest(BaseModel):
 @app.get("/api/health")
 def health():
     return {"status": "ok", "startup_done": STARTUP_DONE,
-            "companies": len(list_companies()), "cached": len(CACHE)}
+      "companies": len(list_companies()), "cached": len(CACHE),
+      "refresh_protected": bool(REFRESH_TOKEN)}
 
 
 @app.get("/api/companies")
@@ -473,10 +480,11 @@ def refresh(
   background_tasks: BackgroundTasks,
   x_refresh_token: str | None = Header(default=None, alias="X-Refresh-Token"),
 ):
-  if REFRESH_TOKEN and x_refresh_token != REFRESH_TOKEN:
+  incoming = (x_refresh_token or "").strip()
+  if REFRESH_TOKEN and incoming != REFRESH_TOKEN:
     raise HTTPException(status_code=401, detail="Unauthorized")
-    background_tasks.add_task(startup_pipeline)
-    return {"status": "refresh triggered"}
+  background_tasks.add_task(startup_pipeline)
+  return {"status": "refresh triggered"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
