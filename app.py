@@ -1,15 +1,3 @@
-"""
-IPO Crunch — Real-time DRHP Analyser
-FastAPI backend + vanilla JS frontend. Zero Gradio. Deploys on Render reliably.
-
-Architecture:
-  - FastAPI serves HTML SPA + REST API
-  - SEBI scraper downloads latest DRHPs on startup and daily
-  - PDF text is read directly (no vectorstore needed)
-  - LLM (OpenRouter/OpenAI) extracts structured data in one call
-  - Results cached in memory, refreshed when new PDFs arrive
-"""
-
 from __future__ import annotations
 from contextlib import asynccontextmanager
 import json, os, re, threading, time
@@ -29,9 +17,6 @@ import uvicorn
 
 load_dotenv()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Config
-# ══════════════════════════════════════════════════════════════════════════════
 IPO_DIR = Path(os.getenv("IPO_DATA_DIR", "./ipo_data"))
 IPO_DIR.mkdir(exist_ok=True)
 
@@ -49,11 +34,8 @@ REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "").strip()
 
 llm = OpenAI(api_key=LLM_KEY or "sk-no-key", base_url=LLM_BASE, timeout=90)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# In-memory cache
-# ══════════════════════════════════════════════════════════════════════════════
-CACHE: dict[str, dict] = {}          # company_key → profile dict
-INFLIGHT: set[str] = set()           # company keys currently being extracted
+CACHE: dict[str, dict] = {}
+INFLIGHT: set[str] = set()
 LOCK = threading.Lock()
 STARTUP_DONE = False
 PIPELINE_LOCK = threading.Lock()
@@ -71,7 +53,6 @@ def _cors_origins() -> list[str]:
       return [render_external]
     return [f"https://{render_external}"]
 
-  # Local/dev fallback.
   return ["*"]
 
 
@@ -119,16 +100,10 @@ def _chat_with_model_fallback(messages: list[dict], temperature: float, max_toke
   raise RuntimeError("LLM call failed without raising a specific error")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PDF utilities
-# ══════════════════════════════════════════════════════════════════════════════
 def read_pdf(path: Path, max_chars: int = 18000) -> str:
-    """Read PDF pages directly — no vectorstore needed."""
     try:
         reader = PdfReader(str(path))
         parts = []
-        # Priority: first 12 pages (cover, summary, objects of issue, price band)
-        # then pages 12-40 (risk factors, financials, business overview)
         priority = list(reader.pages[:12]) + list(reader.pages[12:40])
         for page in priority:
             t = (page.extract_text() or "").strip()
@@ -149,7 +124,6 @@ def find_pdf(company: str) -> Optional[Path]:
         cand = _key(stem)
         if cand == target:
             return p
-        # overlap scoring
         t_tok = set(target.split())
         c_tok = set(cand.split())
         overlap = len(t_tok & c_tok)
@@ -170,11 +144,7 @@ def list_companies() -> list[str]:
     return sorted(set(companies))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SEBI Scraper
-# ══════════════════════════════════════════════════════════════════════════════
 def scrape_sebi_drhps() -> int:
-    """Download latest DRHPs from SEBI. Returns count of new files."""
     SEBI_URL = "https://www.sebi.gov.in/sebiweb/home/HomeAction.do?doListing=yes&sid=3&ssid=15&smid=10"
     HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     downloaded = 0
@@ -194,7 +164,7 @@ def scrape_sebi_drhps() -> int:
 
         print(f"Found {len(links)} DRHP listings")
 
-        for company, href in links[:20]:  # cap at 20 to avoid timeout
+        for company, href in links[:20]:
             out_path = IPO_DIR / f"{company}_DRHP.pdf"
             if out_path.exists():
                 continue
@@ -238,9 +208,6 @@ def scrape_sebi_drhps() -> int:
     return downloaded
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# LLM Extraction
-# ══════════════════════════════════════════════════════════════════════════════
 EXTRACTION_PROMPT = """You are a senior sell-side IPO analyst at a top Indian investment bank.
 Analyse the DRHP filing text below for {company} and return ONLY a single valid JSON object.
 No markdown fences, no prose, just JSON.
@@ -377,7 +344,6 @@ def _fill_missing_basic_metrics(data: dict, text: str) -> dict:
 
 
 def _fetch_web_snippets(company: str) -> str:
-  """Lightweight public web search fallback for live IPO signals (GMP/subscription)."""
   if not ENABLE_WEB_ENRICHMENT:
     return ""
 
@@ -413,7 +379,6 @@ def _fill_missing_from_web(company: str, data: dict) -> dict:
   if not snippets:
     return data
 
-  # Reuse existing DRHP metric parser on search snippets for consistent formatting.
   web_metrics = _extract_basic_metrics_from_text(snippets)
   for field, value in web_metrics.items():
     if not data.get(field) and value:
@@ -445,7 +410,6 @@ def _fill_missing_from_web(company: str, data: dict) -> dict:
 
 
 def extract_profile(company: str, text: str) -> dict:
-  """Single LLM call — extracts all fields at once."""
   if not LLM_KEY:
     return _fallback_profile(company)
   if not text.strip():
@@ -458,7 +422,6 @@ def extract_profile(company: str, text: str) -> dict:
       temperature=0.1,
       max_tokens=2000,
     )
-    # Strip markdown fences if model adds them
     raw = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
     raw = re.sub(r"\s*```$", "", raw).strip()
     data = json.loads(raw)
@@ -507,18 +470,14 @@ def _fallback_profile(company: str) -> dict:
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Background extraction
-# ══════════════════════════════════════════════════════════════════════════════
 def trigger_extraction(company: str, force: bool = False) -> None:
-    """Start async extraction for a company if not already cached/inflight."""
     k = _key(company)
     with LOCK:
         if k in INFLIGHT:
             return
         if not force and k in CACHE and CACHE[k].get("status") == "extracted":
             age = time.time() - CACHE[k].get("extracted_at", 0)
-            if age < 3600:  # 1 hour TTL
+            if age < 3600:
                 return
         INFLIGHT.add(k)
 
@@ -530,7 +489,7 @@ def trigger_extraction(company: str, force: bool = False) -> None:
             profile = extract_profile(company, text)
             with LOCK:
                 CACHE[k] = profile
-            print(f"✅ {company} extracted")
+            print(f"{company} extracted")
         except Exception as e:
             print(f"Extraction error {company}: {e}")
         finally:
@@ -541,7 +500,6 @@ def trigger_extraction(company: str, force: bool = False) -> None:
 
 
 def startup_pipeline() -> None:
-  """Full startup: scrape → extract all companies."""
   global STARTUP_DONE, LAST_STARTUP_STATUS
 
   if not PIPELINE_LOCK.acquire(blocking=False):
@@ -551,9 +509,7 @@ def startup_pipeline() -> None:
   print("=== Startup pipeline starting ===")
   LAST_STARTUP_STATUS = "running"
   try:
-    # 1. Download fresh DRHPs from SEBI
     downloaded = scrape_sebi_drhps()
-    # 2. Extract all companies found (staggered to avoid API rate limits)
     companies = list_companies()
     print(f"Starting extraction for {len(companies)} companies...")
     for i, company in enumerate(companies):
@@ -570,13 +526,9 @@ def startup_pipeline() -> None:
     PIPELINE_LOCK.release()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Chat / RAG
-# ══════════════════════════════════════════════════════════════════════════════
 def chat_with_drhp(company: str, message: str, history: list[dict]) -> str:
-    """Answer questions about a company's DRHP."""
     if not LLM_KEY:
-        return "⚠️ No API key configured. Set OPENROUTER_API_KEY in Render environment variables."
+        return "No API key configured. Set OPENROUTER_API_KEY in Render environment variables."
 
     pdf = find_pdf(company)
     if not pdf:
@@ -598,7 +550,7 @@ DRHP Context (first {len(context)} characters of filing):
 {context}"""
 
     messages = [{"role": "system", "content": system}]
-    for h in history[-6:]:  # last 3 turns
+    for h in history[-6:]:
         messages.append({"role": h["role"], "content": h["content"]})
     messages.append({"role": "user", "content": message})
 
@@ -613,9 +565,6 @@ DRHP Context (first {len(context)} characters of filing):
         return f"Error: {str(e)}"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FastAPI app
-# ══════════════════════════════════════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     if not scheduler.running:
@@ -661,13 +610,11 @@ def profile(company: str, background_tasks: BackgroundTasks):
     if cached and cached.get("status") == "extracted":
         return cached
 
-    # Trigger extraction if not already running
     background_tasks.add_task(trigger_extraction, company)
 
     if cached:
-        return cached  # return pending profile while extraction runs
+        return cached
 
-    # Return fallback immediately
     fp = _fallback_profile(company)
     with LOCK:
         CACHE[k] = fp
@@ -692,9 +639,6 @@ def refresh(
   return {"status": "refresh triggered"}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Frontend HTML — single-page app
-# ══════════════════════════════════════════════════════════════════════════════
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -731,7 +675,6 @@ body {
 }
 .container { max-width: 1440px; margin: 0 auto; padding: 20px; }
 
-/* ── Top bar ── */
 .topbar {
   display: flex; align-items: center; justify-content: space-between;
   padding: 12px 20px;
@@ -763,7 +706,6 @@ select#company-select {
   color: var(--muted);
 }
 
-/* ── Cards ── */
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -783,7 +725,6 @@ select#company-select {
 .card-title { font-family: 'IBM Plex Mono', monospace; font-size: 18px; letter-spacing: .04em; text-transform: uppercase; margin-bottom: 8px; }
 .card-copy { color: var(--muted); font-size: 13px; line-height: 1.6; }
 
-/* ── Hero ── */
 .hero {
   display: grid; grid-template-columns: 1fr 380px; gap: 20px;
   margin-bottom: 20px;
@@ -818,7 +759,6 @@ select#company-select {
 .focus-label { color: var(--accent); font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: .12em; text-transform: uppercase; display: block; margin-bottom: 6px; }
 .focus-value { font-size: 13px; color: var(--text); line-height: 1.4; }
 
-/* ── Signal panel ── */
 .signal-panel { display: flex; flex-direction: column; gap: 12px; }
 .signal-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 18px; }
 .signal-mood {
@@ -841,7 +781,6 @@ select#company-select {
 .thesis-label { color: var(--accent2); font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: .14em; text-transform: uppercase; margin-bottom: 6px; }
 .thesis-text { color: var(--text); font-size: 13px; line-height: 1.7; }
 
-/* ── Metrics grid ── */
 .metrics-grid {
   display: grid;
   grid-template-columns: repeat(6, 1fr);
@@ -860,11 +799,9 @@ select#company-select {
 .metric-value { color: var(--accent); font-family: 'IBM Plex Mono', monospace; font-size: 18px; font-weight: 600; line-height: 1.1; margin-bottom: 8px; text-transform: uppercase; }
 .metric-note { color: var(--muted); font-size: 11px; line-height: 1.4; }
 
-/* ── Charts ── */
 .charts-row { display: grid; grid-template-columns: 3fr 2fr; gap: 20px; margin-bottom: 20px; }
 .chart-container { position: relative; height: 280px; }
 
-/* ── Briefing ── */
 .briefing-row { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
 .briefing-section h4 { font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); margin-bottom: 10px; }
 .briefing-list { list-style: none; }
@@ -876,7 +813,6 @@ select#company-select {
 .proceeds-table td { color: var(--text); font-size: 13px; padding: 10px 0; border-bottom: 1px solid rgba(91,108,128,.12); }
 .briefing-text { color: var(--muted); font-size: 13px; line-height: 1.75; }
 
-/* ── Chat ── */
 .chat-section { margin-bottom: 30px; }
 .chat-messages {
   height: 360px; overflow-y: auto;
@@ -909,12 +845,10 @@ select#company-select {
 }
 .quick-btn:hover { border-color: rgba(255,179,71,.5); background: rgba(32,24,6,.9); }
 
-/* ── Loader ── */
 .skeleton { background: linear-gradient(90deg,rgba(255,255,255,.04) 25%,rgba(255,255,255,.08) 50%,rgba(255,255,255,.04) 75%); background-size: 200% 100%; animation: shimmer 1.5s infinite; border-radius: 3px; }
 @keyframes shimmer { from{background-position:200% 0} to{background-position:-200% 0} }
 .loading-val { display: inline-block; width: 80px; height: 14px; }
 
-/* ── Responsive ── */
 @media(max-width:1100px) { .metrics-grid{grid-template-columns:repeat(3,1fr)} }
 @media(max-width:900px) {
   .hero{grid-template-columns:1fr}
@@ -924,25 +858,23 @@ select#company-select {
 }
 @media(max-width:600px) { .metrics-grid{grid-template-columns:repeat(2,1fr)} }
 
-/* ── Footer ── */
 footer { text-align: center; color: #3a4a5a; font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: .1em; padding: 20px; text-transform: uppercase; }
 </style>
 </head>
 <body>
 
 <nav class="topbar">
-  <div class="topbar-logo">⬡ IPO CRUNCH :: DRHP INTELLIGENCE</div>
+  <div class="topbar-logo">IPO CRUNCH :: DRHP INTELLIGENCE</div>
   <div class="topbar-right">
     <div class="status-dot" id="status-dot"></div>
     <span id="status-text" style="color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:11px">Loading...</span>
     <select id="company-select"><option>Loading companies...</option></select>
-    <button class="btn" onclick="triggerRefresh()">↻ Refresh Data</button>
+    <button class="btn" onclick="triggerRefresh()">Refresh Data</button>
   </div>
 </nav>
 
 <div class="container">
 
-  <!-- Hero -->
   <div class="hero" style="margin-top:20px">
     <div class="hero-main">
       <div class="hero-terminal">
@@ -970,7 +902,6 @@ footer { text-align: center; color: #3a4a5a; font-family: 'IBM Plex Mono', monos
     </div>
   </div>
 
-  <!-- Metrics -->
   <div class="card" style="margin-bottom:20px">
     <div class="kicker" style="margin-bottom:14px">[Live deal snapshot] Primary Market Pulse</div>
     <div class="metrics-grid" id="metrics-grid">
@@ -983,7 +914,6 @@ footer { text-align: center; color: #3a4a5a; font-family: 'IBM Plex Mono', monos
     </div>
   </div>
 
-  <!-- Charts -->
   <div class="charts-row">
     <div class="card">
       <div class="kicker" style="margin-bottom:12px">[Market map] Relative Multiple View</div>
@@ -995,7 +925,6 @@ footer { text-align: center; color: #3a4a5a; font-family: 'IBM Plex Mono', monos
     </div>
   </div>
 
-  <!-- Briefing -->
   <div class="card" style="margin-bottom:20px">
     <div class="kicker" style="margin-bottom:16px">[Deal briefing] Analyst Summary</div>
     <p class="briefing-text" id="briefing-text" style="margin-bottom:20px">—</p>
@@ -1020,7 +949,6 @@ footer { text-align: center; color: #3a4a5a; font-family: 'IBM Plex Mono', monos
     </div>
   </div>
 
-  <!-- Chat -->
   <div class="card chat-section">
     <div class="kicker" style="margin-bottom:12px">[AI Workspace] Ask the DRHP</div>
     <div class="quick-prompts">
@@ -1056,7 +984,6 @@ let peerChart = null;
 let riskChart = null;
 let pollInterval = null;
 
-// ── Init ──────────────────────────────────────────────────────────────────
 async function init() {
   await loadCompanies();
   checkStatus();
@@ -1090,14 +1017,12 @@ async function loadCompanies() {
     sel.innerHTML = '<option value="">— Select IPO —</option>' +
       d.companies.map(c => `<option value="${c}">${c}</option>`).join('');
     sel.onchange = () => { if(sel.value) loadCompany(sel.value); };
-    // Auto-load first
     if (d.companies.length > 0) loadCompany(d.companies[0]);
   } catch(e) {
     setTimeout(loadCompanies, 5000);
   }
 }
 
-// ── Load company ──────────────────────────────────────────────────────────
 async function loadCompany(name) {
   currentCompany = name;
   chatHistory = [];
@@ -1108,7 +1033,6 @@ async function loadCompany(name) {
   const profile = await fetchProfile(name);
   renderProfile(profile);
 
-  // Poll if still pending
   if (profile.status === 'pending') {
     pollInterval = setInterval(async () => {
       const p = await fetchProfile(name);
@@ -1160,23 +1084,19 @@ function setMetricLoading() {
     </div>`).join('');
 }
 
-// ── Render ────────────────────────────────────────────────────────────────
 function renderProfile(p) {
   if (!p || !p.company) return;
 
-  // Hero
   document.getElementById('hero-name').textContent = p.company.toUpperCase();
   document.getElementById('hero-sector').textContent = `[${p.sector || '—'}]`;
   document.getElementById('hero-headline').textContent = p.headline || '—';
   document.getElementById('hero-summary').textContent = p.summary || '';
   document.getElementById('hero-meta').textContent = `${p.sector || '—'} / NSE / BSE / DRHP Filing`;
 
-  // Tags
   const tags = p.hero_tags || [];
   document.getElementById('hero-tags').innerHTML = tags.map(t =>
     `<span class="tag">${t}</span>`).join('');
 
-  // Focus cards
   const focuses = [
     {label:'Demand Signal', value: p.focus_demand},
     {label:'Margin Lens',   value: p.focus_margins},
@@ -1188,7 +1108,6 @@ function renderProfile(p) {
       <div class="focus-value">${f.value || 'Pending analysis...'}</div>
     </div>`).join('');
 
-  // Signal
   document.getElementById('signal-mood').textContent = p.signal_mood || '—';
   document.getElementById('signal-note').textContent = p.signal_note || '';
   document.getElementById('signal-metrics').innerHTML = `
@@ -1197,7 +1116,6 @@ function renderProfile(p) {
     <div class="signal-metric"><span class="signal-metric-label">Mode</span><span class="signal-metric-val">LLM Extract</span></div>`;
   document.getElementById('thesis-text').textContent = p.thesis || '—';
 
-  // Metrics
   const fmt = v => v || 'Awaiting data';
   const metrics = [
     {label:'Issue Size',  value: p.issue_size,           note:'From DRHP',       color:'amber'},
@@ -1214,18 +1132,15 @@ function renderProfile(p) {
       <div class="metric-note">${m.note}</div>
     </div>`).join('');
 
-  // Charts
   renderPeerChart(p);
   renderRiskChart(p);
 
-  // Briefing
   document.getElementById('briefing-text').textContent = p.briefing || '—';
   const ul = (items, cls='') => (items||[]).map(i =>
     `<li class="${cls}">${i}</li>`).join('');
   document.getElementById('upside-list').innerHTML = ul(p.upside);
   document.getElementById('watchlist-list').innerHTML = ul(p.watchlist, 'risk');
 
-  // Proceeds
   const proceeds = [
     {bucket:'Capital Expenditure', val: p.proceeds_capex},
     {bucket:'Debt Repayment',      val: p.proceeds_debt},
@@ -1237,7 +1152,6 @@ function renderProfile(p) {
       ? proceeds.map(r => `<tr><td>${r.bucket}</td><td>${r.val}</td></tr>`).join('')
       : '<tr><td colspan="2" style="color:var(--muted)">Proceeds breakdown not found in filing</td></tr>';
 
-  // Welcome message in chat
   const chatMsgs = document.getElementById('chat-messages');
   chatMsgs.innerHTML = `<div class="msg assistant"><div class="msg-bubble">
     <strong>${p.company} DRHP loaded.</strong><br><br>
@@ -1306,7 +1220,6 @@ function renderRiskChart(p) {
   });
 }
 
-// ── Chat ──────────────────────────────────────────────────────────────────
 async function sendChat() {
   const input = document.getElementById('chat-input');
   const msg = input.value.trim();
@@ -1314,7 +1227,7 @@ async function sendChat() {
   input.value = '';
 
   addMessage('user', msg);
-  const thinking = addMessage('assistant', '⏳ Analysing DRHP...');
+  const thinking = addMessage('assistant', 'Analysing DRHP...');
 
   chatHistory.push({role:'user', content:msg});
 
@@ -1370,17 +1283,11 @@ def root():
     return HTMLResponse(HTML)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Scheduler
-# ══════════════════════════════════════════════════════════════════════════════
 scheduler = BackgroundScheduler()
 scheduler.add_job(startup_pipeline, "cron", hour=2, minute=0,
                   id="daily_scrape", coalesce=True, max_instances=1)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Main
-# ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     print(f"Starting IPO Crunch on port {PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")

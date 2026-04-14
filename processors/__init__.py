@@ -1,8 +1,3 @@
-"""Reference processor modules split out from app.py.
-
-These files are intentionally not imported by app.py so deployment behavior stays unchanged.
-"""
-
 from .config_processor import AppConfig, cors_origins, company_key
 from .pdf_processor import read_pdf, find_pdf, list_companies
 from .sebi_scraper_processor import scrape_sebi_drhps
